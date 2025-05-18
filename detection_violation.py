@@ -17,6 +17,8 @@ from hailo_apps_infra.detection_pipeline import GStreamerDetectionApp
 import datetime
 import pylivestream.api as pls
 import subprocess
+import threading
+import queue
 
 
 import firebase_admin
@@ -33,8 +35,16 @@ firebase_admin.initialize_app(cred, {
 db = firestore.client()
 bucket = storage.bucket()
 
-bike_count_doc_ref = None 
+# -----------------------------------------------------------------------------------------------
+# Variable
+# -----------------------------------------------------------------------------------------------
 stream_url = "rtmp://a.rtmp.youtube.com/live2/wdr2-9vr0-18ha-gfvm-c60x"
+last_update_data = {
+    "bike_count": -1,
+    "violation_count": -1
+}
+bike_count_doc_ref = None 
+# -----------------------------------------------------------------------------------------------
 
 # -----------------------------------------------------------------------------------------------
 # User-defined class to be used in the callback function
@@ -56,6 +66,33 @@ class user_app_callback_class(app_callback_class):
 
         self.ffmpeg_process = None
         self.frame_sent = False
+        
+        self.violation_queue = queue.Queue()
+        self.violation_saver_thread = threading.Thread(target=self._violation_saver_worker, daemon=True)
+        self.violation_saver_thread.start()
+        
+    def _violation_saver_worker(self):
+        while True:
+            try:
+                image_bytes, metadata = self.violation_queue.get()
+                self._upload_violation(image_bytes, metadata)
+                self.violation_queue.task_done()
+            except Exception as e:
+                print(f"[THREAD ERROR] {e}")
+                
+    def _upload_violation(self, image_bytes, metadata):
+        blob = bucket.blob(f"pelanggaran/{metadata['filename']}")
+        blob.upload_from_string(image_bytes, content_type='image/jpeg')
+        blob.make_public()
+
+        doc_id = f"pelanggaran_{metadata['tanggal']}_{metadata['waktu']}_{metadata['track_id']}"
+        db.collection("pelanggaran").document(doc_id).set({
+            "pelanggaran": metadata['filename'],
+            "tanggal": metadata['tanggal'],
+            "waktu": metadata['waktu'],
+            "url": blob.public_url
+        })
+        print(f"[UPLOAD] Pelanggaran disimpan: {metadata['filename']}")
 
 # -----------------------------------------------------------------------------------------------
 # User-defined callback function
@@ -205,12 +242,26 @@ def app_callback(pad, info, user_data):
                     user_data.violation_count += 1
                     user_data.counted_violation_ids.add(track_id)
                     if user_data.use_frame and format and width and height:
-                        save_violation_crop(frame, sv_detections.xyxy[i], track_id, db, bucket)
-                elif v == 0 and track_id not in user_data.counted_compliant_ids:
-                    user_data.compliant_count += 1
-                    user_data.counted_compliant_ids.add(track_id)
-                    #if user_data.use_frame and format and width and height:
-                        #save_violation_crop(frame, sv_detections.xyxy[i], track_id, db, bucket)
+                        crop = frame[
+                            sv_detections.xyxy[i][1]:sv_detections.xyxy[i][3],
+                            sv_detections.xyxy[i][0]:sv_detections.xyxy[i][2]
+                        ]
+                        crop_rgb = cv2.cvtColor(crop, cv2.COLOR_BGR2RGB)
+                        success, buffer = cv2.imencode('.jpg', crop_rgb)
+                        if success:
+                            now = datetime.datetime.now()
+                            date = now.strftime("%Y-%m-%d")
+                            time_str = now.strftime("%H-%M-%S")
+                            filename = f"violation_{date}_{time_str}_{track_id}.jpg"
+                            metadata = {
+                                "tanggal": date,
+                                "waktu": time_str,
+                                "track_id": track_id,
+                                "filename": filename
+                            }
+                            user_data.violation_queue.put((buffer.tobytes(), metadata))
+                        else:
+                            print(f"[ERROR] Gagal encode image untuk track_id {track_id}")
 
         print(f"[INFO] Frame {user_data.get_count()} - Bike Count (Right-to-Left): {user_data.line_zone.in_count}")
         print(f"[INFO] Jumlah Pelanggaran: {user_data.violation_count}")
@@ -221,8 +272,6 @@ def app_callback(pad, info, user_data):
             frame=annotated_frame,
             line_counter=user_data.line_zone
         )
-        cv2.putText(annotated_frame, f"Right-to-Left: {user_data.line_zone.in_count}",
-                    (30, 40), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 255), 2)
         annotated_frame = cv2.cvtColor(annotated_frame, cv2.COLOR_RGB2BGR)
         user_data.set_frame(annotated_frame)
 
@@ -252,27 +301,40 @@ def update_bike_count_document(user_data):
     if bike_count_doc_ref is None:
         print("[ERROR] bike_count_doc_ref is not initialized.")
         return
-    if bike_count_doc_ref is None:
-        print("[ERROR] bike_count_doc_ref is not initialized.")
+        
+    bike_count = user_data.line_zone.in_count
+    violation_count = user_data.violation_count
+
+    # Hindari update jika tidak ada perubahan
+    if (bike_count == last_update_data["bike_count"] and violation_count == last_update_data["violation_count"]):
         return
+        
     date = datetime.datetime.now().strftime("%Y-%m-%d")
     time = datetime.datetime.now().strftime("%H-%M-%S")
     end_time = f"{date}_{time}"
-    bike_count = user_data.line_zone.in_count
-    violation_count = user_data.violation_count
-    bike_count_doc_ref.update({
-        "waktu_akhir": end_time,
-        "jumlah_motor": bike_count,
-        "jumlah_pelanggaran": violation_count
-    })
-    print(f"[UPDATE] bike_count updated: end_time={end_time}, Bikes={bike_count}, Violations={violation_count}")
+    
+    try:
+        bike_count_doc_ref.update({
+            "waktu_akhir": end_time,
+            "jumlah_motor": bike_count,
+            "jumlah_pelanggaran": violation_count
+        })
+        last_update_data["bike_count"] = bike_count
+        last_update_data["violation_count"] = violation_count
+        print(f"[UPDATE] Firestore updated: {bike_count=} {violation_count=} {end_time=}")
+    except Exception as e:
+        print(f"[ERROR] Failed to update Firestore: {e}")
     
 # Scheduler for Update Bikes Counting Record Function
 def schedule_updates(user_data):
     def update(_):
-        update_bike_count_document(user_data)
-        return True  # agar terus berulang
-    GLib.timeout_add_seconds(10, update, None)
+        threading.Thread(
+            target=update_bike_count_document,
+            args=(user_data,),
+            daemon=True
+        ).start()
+        return True  # terus berulang
+    GLib.timeout_add_seconds(5, update, None)
 
 # -----------------------------------------------------------------------------------------------
 # Save Violation
@@ -282,19 +344,26 @@ def save_violation_crop(frame, bbox, track_id, db, bucket):
     crop = frame[y1:y2, x1:x2]
     rgb_image = cv2.cvtColor(crop, cv2.COLOR_BGR2RGB)
     date = datetime.datetime.now().strftime("%Y-%m-%d") 
-    time = datetime.datetime.now().strftime("%H-%M-%S")   
-    os.makedirs("violations", exist_ok=True)
+    time = datetime.datetime.now().strftime("%H-%M-%S")
     filename = f"violation_{date}_{time}_{track_id}.jpg"
+    
+    '''
+    # save img in locak disk
+    os.makedirs("violations", exist_ok=True)
     filepath = os.path.join("violations", filename)
     cv2.imwrite(filepath, rgb_image)
     print(f"[SAVE IMG] save unhelmet violation img: {filename}")
+    '''
+    # save img in memory
+    success, buffer = cv2.imencode('.jpg', rgb_image)
+    if not success:
+        print(f"[ERROR] Gagal mengencode image untuk track_id {track_id}")
+        return
 
-    
     # Upload ke Firebase Storage
     blob = bucket.blob(f"pelanggaran/{filename}")
-    blob.upload_from_filename(filepath)
-    blob.make_public() 
-    
+    blob.upload_from_string(buffer.tobytes(), content_type='image/jpeg')
+    blob.make_public()     
     
     # Simpan metadata ke Firestore
     doc_id = f"pelanggaran_{date}_{time}_{track_id}"
