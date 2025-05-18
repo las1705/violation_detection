@@ -17,6 +17,8 @@ from hailo_apps_infra.detection_pipeline import GStreamerDetectionApp
 import datetime
 import pylivestream.api as pls
 import subprocess
+import threading
+import queue
 
 
 import firebase_admin
@@ -56,6 +58,19 @@ class user_app_callback_class(app_callback_class):
 
         self.ffmpeg_process = None
         self.frame_sent = False
+        
+        self.violation_queue = queue.Queue()
+        self.violation_saver_thread = threading.Thread(target=self._violation_saver_worker, daemon=True)
+        self.violation_saver_thread.start()
+        
+    def _violation_saver_worker(self):
+        while True:
+            try:
+                frame, bbox, track_id = self.violation_queue.get()
+                save_violation_crop(frame, bbox, track_id, db, bucket)
+                self.violation_queue.task_done()
+            except Exception as e:
+                print(f"[THREAD ERROR] {e}")
 
 # -----------------------------------------------------------------------------------------------
 # User-defined callback function
@@ -205,12 +220,7 @@ def app_callback(pad, info, user_data):
                     user_data.violation_count += 1
                     user_data.counted_violation_ids.add(track_id)
                     if user_data.use_frame and format and width and height:
-                        save_violation_crop(frame, sv_detections.xyxy[i], track_id, db, bucket)
-                elif v == 0 and track_id not in user_data.counted_compliant_ids:
-                    user_data.compliant_count += 1
-                    user_data.counted_compliant_ids.add(track_id)
-                    #if user_data.use_frame and format and width and height:
-                        #save_violation_crop(frame, sv_detections.xyxy[i], track_id, db, bucket)
+                        user_data.violation_queue.put((frame.copy(), sv_detections.xyxy[i], track_id))
 
         print(f"[INFO] Frame {user_data.get_count()} - Bike Count (Right-to-Left): {user_data.line_zone.in_count}")
         print(f"[INFO] Jumlah Pelanggaran: {user_data.violation_count}")
@@ -252,9 +262,6 @@ def update_bike_count_document(user_data):
     if bike_count_doc_ref is None:
         print("[ERROR] bike_count_doc_ref is not initialized.")
         return
-    if bike_count_doc_ref is None:
-        print("[ERROR] bike_count_doc_ref is not initialized.")
-        return
     date = datetime.datetime.now().strftime("%Y-%m-%d")
     time = datetime.datetime.now().strftime("%H-%M-%S")
     end_time = f"{date}_{time}"
@@ -272,7 +279,7 @@ def schedule_updates(user_data):
     def update(_):
         update_bike_count_document(user_data)
         return True  # agar terus berulang
-    GLib.timeout_add_seconds(10, update, None)
+    GLib.timeout_add_seconds(5, update, None)
 
 # -----------------------------------------------------------------------------------------------
 # Save Violation
@@ -282,19 +289,26 @@ def save_violation_crop(frame, bbox, track_id, db, bucket):
     crop = frame[y1:y2, x1:x2]
     rgb_image = cv2.cvtColor(crop, cv2.COLOR_BGR2RGB)
     date = datetime.datetime.now().strftime("%Y-%m-%d") 
-    time = datetime.datetime.now().strftime("%H-%M-%S")   
-    os.makedirs("violations", exist_ok=True)
+    time = datetime.datetime.now().strftime("%H-%M-%S")
     filename = f"violation_{date}_{time}_{track_id}.jpg"
+    
+    '''
+    # save img in locak disk
+    os.makedirs("violations", exist_ok=True)
     filepath = os.path.join("violations", filename)
     cv2.imwrite(filepath, rgb_image)
     print(f"[SAVE IMG] save unhelmet violation img: {filename}")
+    '''
+    # save img in memory
+    success, buffer = cv2.imencode('.jpg', rgb_image)
+    if not success:
+        print(f"[ERROR] Gagal mengencode image untuk track_id {track_id}")
+        return
 
-    
     # Upload ke Firebase Storage
     blob = bucket.blob(f"pelanggaran/{filename}")
-    blob.upload_from_filename(filepath)
-    blob.make_public() 
-    
+    blob.upload_from_string(buffer.tobytes(), content_type='image/jpeg')
+    blob.make_public()     
     
     # Simpan metadata ke Firestore
     doc_id = f"pelanggaran_{date}_{time}_{track_id}"
