@@ -20,7 +20,6 @@ import subprocess
 import threading
 import queue
 
-
 import firebase_admin
 from firebase_admin import credentials, firestore, storage
 
@@ -56,13 +55,15 @@ class user_app_callback_class(app_callback_class):
         self.frame_height = None
         self.line_zone = None
         self.line_annotator = None
+        self.annotated_frame = None
+        
         self.crossed_track_ids = set()
         self.counted_violation_ids = set()
         self.counted_compliant_ids = set()
         self.violation_count = 0
         self.compliant_count = 0
         
-        self.use_frame = True
+        self.use_frame = True 
 
         self.ffmpeg_process = None
         self.frame_sent = False
@@ -81,8 +82,12 @@ class user_app_callback_class(app_callback_class):
                 print(f"[THREAD ERROR] {e}")
                 
     def _upload_violation(self, image_bytes, metadata):
-        blob = bucket.blob(f"pelanggaran/{metadata['filename']}")
-        blob.upload_from_string(image_bytes, content_type='image/jpeg')
+        print(f"[DEBUG] Uploading violation: {metadata['filename']}")
+        try:
+            blob = bucket.blob(f"pelanggaran/{metadata['filename']}")
+            blob.upload_from_string(image_bytes, content_type='image/jpeg')
+        except Exception as e:
+            print(f"[UPLOAD ERROR] {e}")
         blob.make_public()
 
         doc_id = f"pelanggaran_{metadata['tanggal']}_{metadata['waktu']}_{metadata['track_id']}"
@@ -95,187 +100,205 @@ class user_app_callback_class(app_callback_class):
         print(f"[UPLOAD] Pelanggaran disimpan: {metadata['filename']}")
 
 # -----------------------------------------------------------------------------------------------
-# User-defined callback function
+# Suport Function function
 # -----------------------------------------------------------------------------------------------
-def app_callback(pad, info, user_data):
-    user_data.use_frame = True
-    buffer = info.get_buffer()
-    if buffer is None:
-        return Gst.PadProbeReturn.OK
-
-    user_data.increment()
-    format, width, height = get_caps_from_pad(pad)
-    user_data.frame_width = width
-    user_data.frame_height = height
-    
-    # DEBUG FORMAT SIZE BUFFER USE_DATA.USE_FRAME
-    #print(f"[DEBUG] Frame format: {format}, size: {width}x{height}")
-    #print(f"[DEBUG] Frame user_data.use_frame {user_data.use_frame}, size: {width}x{height} | Buffer {buffer}")
-    
-    frame = None
-    if user_data.use_frame and format and width and height:
-        frame = get_numpy_from_buffer(buffer, format, width, height)
-    
+def _init_ffmpeg_if_needed(user_data, frame, width, height):
     if user_data.ffmpeg_process is None and frame is not None:
-            ffmpeg_cmd = [
-                'ffmpeg',
-                '-y',
-                '-f', 'rawvideo', 
-                '-vcodec', 'rawvideo',
-                '-pix_fmt', 'rgb24',
-                '-s', f'{width}x{height}',
-                '-r', '30',
-                '-i', '-',
-                '-f', 'lavfi', '-i', 'anullsrc',
-                '-c:v', 'libx264',
-                '-preset', 'veryfast',
-                '-b:v', '3000k',
-                '-maxrate', '3000k',
-                '-bufsize', '6000k',
-                '-c:a', 'aac',
-                '-b:a', '128k',
-                '-f', 'flv',
-                stream_url
-            ]
-            user_data.ffmpeg_process = subprocess.Popen(ffmpeg_cmd, stdin=subprocess.PIPE)
-            print("[FFMPEG] Streaming process started.")
-        
+        ffmpeg_cmd = [
+            'ffmpeg', '-y',
+            '-f', 'rawvideo', '-vcodec', 'rawvideo', '-pix_fmt', 'rgb24',
+            '-s', f'{width}x{height}', '-r', '30', '-i', '-',
+            '-f', 'lavfi', '-i', 'anullsrc',
+            '-c:v', 'libx264', '-preset', 'veryfast',
+            '-b:v', '3000k', '-maxrate', '3000k', '-bufsize', '6000k',
+            '-c:a', 'aac', '-b:a', '128k',
+            '-f', 'flv', stream_url
+        ]
+        user_data.ffmpeg_process = subprocess.Popen(ffmpeg_cmd, stdin=subprocess.PIPE)
+        print("[FFMPEG] Streaming process started.")
+
+def _send_frame_to_ffmpeg(user_data, frame):
     if frame is not None and user_data.ffmpeg_process is not None:
-        # Kirim frame ke ffmpeg stdin
         try:
             user_data.ffmpeg_process.stdin.write(frame.tobytes())
         except Exception as e:
             print(f"[FFMPEG ERROR] {e}")
 
-    # DEBUG FRAME
-    '''
-    if frame is None:
-        print(f"[ERROR] get_numpy_from_buffer returned None | Frame shape: {frame}, dtype: {frame}")
-    else:
-        print(f"[DEBUG] Frame shape: {frame.shape}, dtype: {frame.dtype}")
-    '''
-        
+def _init_line_zone(user_data, width, height):
+    x_center = width // 2
+    user_data.line_zone = sv.LineZone(
+        start=sv.Point(x_center, height),
+        end=sv.Point(x_center, 0)
+    )
+    user_data.line_annotator = sv.LineZoneAnnotator(thickness=2, text_thickness=2, text_scale=1)
 
-    if user_data.line_zone is None:
-        x_center = width // 2
-        user_data.line_zone = sv.LineZone(start=sv.Point(x_center, height), end=sv.Point(x_center, 0))
-        user_data.line_annotator = sv.LineZoneAnnotator(thickness=2, text_thickness=2, text_scale=1)
-
-    roi = hailo.get_roi_from_buffer(buffer)
-    detections = roi.get_objects_typed(hailo.HAILO_DETECTION)
-
-    bike_detections = []
-    helmet_detections = []
-    unhelmet_detections = []
-
+def _classify_detections(detections, width, height):
+    bikes, helmets, unhelmets = [], [], []
     for det in detections:
         label = det.get_label()
         bbox = det.get_bbox()
-        x1 = int(bbox.xmin() * width)
-        y1 = int(bbox.ymin() * height)
-        x2 = int(bbox.xmax() * width)
-        y2 = int(bbox.ymax() * height)
-        conf = det.get_confidence()
+        x1, y1 = int(bbox.xmin() * width), int(bbox.ymin() * height)
+        x2, y2 = int(bbox.xmax() * width), int(bbox.ymax() * height)
+        center = ((x1 + x2) // 2, (y1 + y2) // 2)
 
         if label == "bike":
             track = det.get_objects_typed(hailo.HAILO_UNIQUE_ID)
-            track_id = track[0].get_id() if len(track) == 1 else None
-            bike_detections.append({
-                "bbox": [x1, y1, x2, y2],
-                "conf": conf,
-                "track_id": track_id,
-                "helmet": [],
-                "unhelmet": []
-            })
+            track_id = track[0].get_id() if track else None
+            bikes.append({"bbox": [x1, y1, x2, y2], "conf": det.get_confidence(), "track_id": track_id, "helmet": [], "unhelmet": []})
         elif label == "helmet":
-            helmet_detections.append({"center": ((x1 + x2) // 2, (y1 + y2) // 2)})
+            helmets.append({"center": center})
         elif label == "unhelmet":
-            unhelmet_detections.append({"center": ((x1 + x2) // 2, (y1 + y2) // 2)})
+            unhelmets.append({"center": center})
+    return {"bikes": bikes, "helmets": helmets, "unhelmets": unhelmets}
 
-    for bike in bike_detections:
+def _associate_helmet_status(detections):
+    for bike in detections["bikes"]:
         x1, y1, x2, y2 = bike["bbox"]
-        for h in helmet_detections:
+        for h in detections["helmets"]:
             cx, cy = h["center"]
             if x1 <= cx <= x2 and y1 <= cy <= y2:
                 bike["helmet"].append(h)
-        for uh in unhelmet_detections:
+        for uh in detections["unhelmets"]:
             cx, cy = uh["center"]
             if x1 <= cx <= x2 and y1 <= cy <= y2:
                 bike["unhelmet"].append(uh)
 
-    xyxy = []
-    confidences = []
-    class_ids = []
-    tracker_ids = []
-    violation_status = []
+def _prepare_sv_detections(bikes):
+    if not bikes["bikes"]:
+        return None, None
 
-    for bike in bike_detections:
+    xyxy, confs, class_ids, track_ids, violations = [], [], [], [], []
+
+    for bike in bikes["bikes"]:
         xyxy.append(bike["bbox"])
-        confidences.append(bike["conf"])
+        confs.append(bike["conf"])
         class_ids.append(0)
-        tracker_ids.append(bike["track_id"])
-        is_violation = len(bike["unhelmet"]) > 0
-        violation_status.append(1 if is_violation else 0)
+        track_ids.append(bike["track_id"])
+        violations.append(1 if len(bike["unhelmet"]) > 0 else 0)
 
-    if len(xyxy) > 0:
-        sv_detections = sv.Detections(
-            xyxy=np.array(xyxy, dtype=int),
-            confidence=np.array(confidences),
-            class_id=np.array(class_ids),
-            tracker_id=np.array(tracker_ids)
-        )
+    detections = sv.Detections(
+        xyxy=np.array(xyxy, dtype=int),
+        confidence=np.array(confs),
+        class_id=np.array(class_ids),
+        tracker_id=np.array(track_ids)
+    )
+    return detections, violations
 
-        before_count = user_data.line_zone.in_count
-        user_data.line_zone.trigger(detections=sv_detections)
-        after_count = user_data.line_zone.in_count
+def _update_crossed_ids(user_data, detections):
+    before = user_data.line_zone.in_count
+    user_data.line_zone.trigger(detections=detections)
+    after = user_data.line_zone.in_count
 
-        if after_count > before_count:
-            for i in range(len(sv_detections)):
-                tid = sv_detections.tracker_id[i]
-                if tid is not None:
-                    user_data.crossed_track_ids.add(tid)
+    if after > before:
+        for i in range(len(detections)):
+            tid = detections.tracker_id[i]
+            if tid is not None:
+                user_data.crossed_track_ids.add(tid)
 
-        for i, v in enumerate(violation_status):
-            track_id = sv_detections.tracker_id[i]
-            if track_id in user_data.crossed_track_ids:
-                if v == 1 and track_id not in user_data.counted_violation_ids:
-                    user_data.violation_count += 1
-                    user_data.counted_violation_ids.add(track_id)
-                    if user_data.use_frame and format and width and height:
-                        crop = frame[
-                            sv_detections.xyxy[i][1]:sv_detections.xyxy[i][3],
-                            sv_detections.xyxy[i][0]:sv_detections.xyxy[i][2]
-                        ]
-                        crop_rgb = cv2.cvtColor(crop, cv2.COLOR_BGR2RGB)
-                        success, buffer = cv2.imencode('.jpg', crop_rgb)
-                        if success:
-                            now = datetime.datetime.now()
-                            date = now.strftime("%Y-%m-%d")
-                            time_str = now.strftime("%H-%M-%S")
-                            filename = f"violation_{date}_{time_str}_{track_id}.jpg"
-                            metadata = {
-                                "tanggal": date,
-                                "waktu": time_str,
-                                "track_id": track_id,
-                                "filename": filename
-                            }
-                            user_data.violation_queue.put((buffer.tobytes(), metadata))
-                        else:
-                            print(f"[ERROR] Gagal encode image untuk track_id {track_id}")
+def _handle_violations(user_data, detections, violations, frame):
+    for i, is_violation in enumerate(violations):
+        track_id = detections.tracker_id[i]
+        if track_id in user_data.crossed_track_ids and is_violation and track_id not in user_data.counted_violation_ids:
+            user_data.violation_count += 1
+            user_data.counted_violation_ids.add(track_id)
+            
+            if frame is not None:
+                x1, y1, x2, y2 = detections.xyxy[i]
 
-        print(f"[INFO] Frame {user_data.get_count()} - Bike Count (Right-to-Left): {user_data.line_zone.in_count}")
-        print(f"[INFO] Jumlah Pelanggaran: {user_data.violation_count}")
+                # Validasi agar bbox tidak keluar dari dimensi frame
+                height, width, _ = frame.shape
+                x1 = max(0, min(x1, width - 1))
+                x2 = max(0, min(x2, width))
+                y1 = max(0, min(y1, height - 1))
+                y2 = max(0, min(y2, height))
 
-    if user_data.use_frame and frame is not None:
-        annotated_frame = frame.copy()
-        user_data.line_annotator.annotate(
-            frame=annotated_frame,
-            line_counter=user_data.line_zone
-        )
-        annotated_frame = cv2.cvtColor(annotated_frame, cv2.COLOR_RGB2BGR)
-        user_data.set_frame(annotated_frame)
+                if x2 > x1 and y2 > y1:
+                    crop = frame[y1:y2, x1:x2]
+                    crop_rgb = cv2.cvtColor(crop, cv2.COLOR_BGR2RGB)
+                    success, buffer = cv2.imencode('.jpg', crop_rgb)
+                    if success:
+                        now = datetime.datetime.now()
+                        date = now.strftime("%Y-%m-%d")
+                        time_str = now.strftime("%H-%M-%S")
+                        filename = f"violation_{date}_{time_str}_{track_id}.jpg"
+                        metadata = {
+                            "tanggal": date,
+                            "waktu": time_str,
+                            "track_id": track_id,
+                            "filename": filename
+                        }
+                        user_data.violation_queue.put((buffer.tobytes(), metadata))
+                    else:
+                        print(f"[ERROR] Gagal encode image untuk track_id {track_id}")
+                else:
+                    print(f"[WARNING] Bounding box tidak valid untuk track_id {track_id}")
+
+def _log_counts(user_data):
+    print(f"[INFO] Frame {user_data.get_count()} - Bike Count (Right-to-Left): {user_data.line_zone.in_count}")
+    print(f"[INFO] Jumlah Pelanggaran: {user_data.violation_count}")
+
+def _annotate_frame(user_data, frame):
+    annotated = frame.copy()
+    user_data.line_annotator.annotate(
+        frame=annotated,
+        line_counter=user_data.line_zone
+    )
+    annotated_bgr = cv2.cvtColor(annotated, cv2.COLOR_RGB2BGR)
+    #user_data.set_frame(annotated_bgr)
+    user_data.annotated_frame = annotated_bgr
+    # print(f'[YTYT] frame yt (_annotate_frame)= {user_data.annotated_frame}')
+
+
+
+# -----------------------------------------------------------------------------------------------
+# User-defined callback function
+# -----------------------------------------------------------------------------------------------
+def app_callback(pad, info, user_data):
+    buffer = info.get_buffer()
+    if buffer is None:
+        return Gst.PadProbeReturn.OK
+
+    user_data.increment()
+
+    format, width, height = get_caps_from_pad(pad)
+    user_data.frame_width = width
+    user_data.frame_height = height
+    
+    user_data.use_frame =True
+
+    frame = None
+    if format and width and height:
+        frame = get_numpy_from_buffer(buffer, format, width, height)
+
+    _init_ffmpeg_if_needed(user_data, frame, width, height)
+
+    if user_data.line_zone is None:
+        _init_line_zone(user_data, width, height)
+
+    detections = hailo.get_roi_from_buffer(buffer).get_objects_typed(hailo.HAILO_DETECTION)
+    bike_detections = _classify_detections(detections, width, height)
+
+    _associate_helmet_status(bike_detections)
+    
+    sv_detections, violation_status = _prepare_sv_detections(bike_detections)
+
+    if sv_detections is not None:
+        _update_crossed_ids(user_data, sv_detections)
+        _handle_violations(user_data, sv_detections, violation_status, frame)
+        _log_counts(user_data)
+        # print(f'sv_detection {user_data.use_frame} |-| {frame}')
+
+        if user_data.use_frame and frame is not None:
+            print('sv_detection in if []')
+            _annotate_frame(user_data, frame)
+            
+        frame_to_send = user_data.annotated_frame if user_data.annotated_frame is not None else frame
+        # print(f'[YTYT] frame yt (_app_callback)= {user_data.annotated_frame}')
+        _send_frame_to_ffmpeg(user_data, frame_to_send)
 
     return Gst.PadProbeReturn.OK
+
+
 
 # -----------------------------------------------------------------------------------------------
 # Initialitation Function for Bikes Counting Record
@@ -335,44 +358,6 @@ def schedule_updates(user_data):
         ).start()
         return True  # terus berulang
     GLib.timeout_add_seconds(5, update, None)
-
-# -----------------------------------------------------------------------------------------------
-# Save Violation
-# -----------------------------------------------------------------------------------------------
-def save_violation_crop(frame, bbox, track_id, db, bucket):
-    x1, y1, x2, y2 = bbox
-    crop = frame[y1:y2, x1:x2]
-    rgb_image = cv2.cvtColor(crop, cv2.COLOR_BGR2RGB)
-    date = datetime.datetime.now().strftime("%Y-%m-%d") 
-    time = datetime.datetime.now().strftime("%H-%M-%S")
-    filename = f"violation_{date}_{time}_{track_id}.jpg"
-    
-    '''
-    # save img in locak disk
-    os.makedirs("violations", exist_ok=True)
-    filepath = os.path.join("violations", filename)
-    cv2.imwrite(filepath, rgb_image)
-    print(f"[SAVE IMG] save unhelmet violation img: {filename}")
-    '''
-    # save img in memory
-    success, buffer = cv2.imencode('.jpg', rgb_image)
-    if not success:
-        print(f"[ERROR] Gagal mengencode image untuk track_id {track_id}")
-        return
-
-    # Upload ke Firebase Storage
-    blob = bucket.blob(f"pelanggaran/{filename}")
-    blob.upload_from_string(buffer.tobytes(), content_type='image/jpeg')
-    blob.make_public()     
-    
-    # Simpan metadata ke Firestore
-    doc_id = f"pelanggaran_{date}_{time}_{track_id}"
-    db.collection("pelanggaran").document(doc_id).set({
-        "pelanggaran": filename,
-        "tanggal": date,
-        "waktu": time,
-        "url": blob.public_url
-    })
 
 # -----------------------------------------------------------------------------------------------
 # Main
